@@ -112,9 +112,12 @@ def mapRange(a: Tuple[float, float], b: Tuple[float, float], s: float) -> float:
         return b1  # Avoid division by zero
     return b1 + ((s - a1) * (b2 - b1) / (a2 - a1))
 
-def get_extrusion_command(x: float, y: float, extrusion: float) -> str:
+def get_extrusion_command(x: float, y: float, extrusion: float, feedrate: float) -> str:
     """Format a G-code string from the X, Y coordinates and extrusion value."""
-    return "G1 X{} Y{} E{}\n".format(round(x, 3), round(y, 3), round(extrusion, 5))
+    if feedrate>0:
+        return "G1 X{} Y{} E{} F{}\n".format(round(x, 3), round(y, 3), round(extrusion, 5), round(feedrate, 3))
+    else:
+        return "G1 X{} Y{} E{}\n".format(round(x, 3), round(y, 3), round(extrusion, 5))
 
 def is_begin_layer_line(line: str) -> bool:
     """Check if current line is the start of a layer section."""
@@ -194,6 +197,9 @@ def read_config(config_file_path: str) -> Dict[str, float]:
     }
     return params
 
+def reduce_by_percentage(value, percentage):
+    return value / (percentage / 100)
+
 def process_gcode_file(
     gcode_file_path: str,
     max_flow: float,
@@ -209,6 +215,7 @@ def process_gcode_file(
     prog_g2_g3 = re.compile(r'^G[2-3]')
     prog_relative_extrusion = re.compile(r'^M83')
     prog_absolute_extrusion = re.compile(r'^M82')
+    prog_g1_feedrate = re.compile(r'^G1.+F([\d\.]+)')
 
     lines = []
     edit = 0
@@ -219,8 +226,8 @@ def process_gcode_file(
     relative_extrusion = False
     g2_g3_used = False
     g2_g3_lines = []
-    duplicate_speed_command = False
-    last_speed_command = None
+    relative_extrusion_set = False
+    g1_feedrate = 0
     perimeterSegments = []
     infill_type = None  # Will be set after extracting from G-code
 
@@ -240,6 +247,14 @@ def process_gcode_file(
     for currentLine in gcode_lines:
         writtenToFile = False
 
+        #keep tack of extrusion mode
+        if prog_relative_extrusion.search(currentLine):
+            relative_extrusion_set = True
+        elif prog_absolute_extrusion.search(currentLine):
+            relative_extrusion_set = False
+
+
+
         # Search if it indicates a type
         if prog_type.search(currentLine):
             if is_begin_inner_wall_line(currentLine):
@@ -248,6 +263,7 @@ def process_gcode_file(
                 currentSection = Section.NOTHING
             elif is_begin_infill_segment_line(currentLine):
                 currentSection = Section.INFILL
+                g1_feedrate = 0
             else:
                 currentSection = Section.NOTHING
 
@@ -255,20 +271,22 @@ def process_gcode_file(
             perimeterSegments.append(Segment(getXY(currentLine), lastPosition))
 
         if currentSection == Section.INFILL:
+            # check extrusion mode
+            if not relative_extrusion_set:
+                print("!!!ERROR!!! Please don't use relative extrusion on infill")
+                print("!!!ERROR!!! Please don't use relative extrusion on infill")
+                print("!!!ERROR!!! Please don't use relative extrusion on infill")
+                exit(1)
+
+
             # Check for G2/G3 commands **only in the infill section**
             if prog_g2_g3.search(currentLine):
                 g2_g3_used = True
                 g2_g3_lines.append(currentLine.strip())
 
-            if "F" in currentLine and "G1" in currentLine:
-                # Prevent duplicate G1 F commands
-                if currentLine.strip() == last_speed_command:
-                    duplicate_speed_command = True
-                else:
-                    lines.append(currentLine)
-                    last_speed_command = currentLine.strip()
-                    duplicate_speed_command = False
-                continue
+            prog_g1_feedrate_match = prog_g1_feedrate.match(currentLine)
+            if prog_g1_feedrate_match:
+                g1_feedrate = float(prog_g1_feedrate_match.group(1))
 
             if prog_extrusion.search(currentLine):
                 currentPosition = getXY(currentLine)
@@ -301,14 +319,15 @@ def process_gcode_file(
                             shortestDistance = min_distance_from_segment(
                                 Segment(lastPosition, segmentEnd), perimeterSegments
                             )
-                            if shortestDistance < gradient_thickness:
-                                segmentExtrusion = extrusionLengthPerSegment * mapRange(
-                                    (0, gradient_thickness), (max_flow / 100, min_flow / 100), shortestDistance
-                                )
-                            else:
-                                segmentExtrusion = extrusionLengthPerSegment * min_flow / 100
+                            extrusion_ratio = mapRange(
+                                (0, gradient_thickness), 
+                                (max_flow / 100, min_flow / 100), 
+                                min(shortestDistance, gradient_thickness)
+                            )
+                            segmentExtrusion = extrusionLengthPerSegment * extrusion_ratio
+                            feedrate = reduce_by_percentage(g1_feedrate, extrusion_ratio*100)
 
-                            lines.append(get_extrusion_command(segmentEnd.x, segmentEnd.y, segmentExtrusion))
+                            lines.append(get_extrusion_command(segmentEnd.x, segmentEnd.y, segmentExtrusion, feedrate))
                             lastPosition = segmentEnd
                         # Missing Segment
                         segmentLengthRatio = get_points_distance(lastPosition, currentPosition) / segmentLength if segmentLength != 0 else 0
@@ -317,15 +336,21 @@ def process_gcode_file(
                                 currentPosition.x,
                                 currentPosition.y,
                                 segmentLengthRatio * extrusionLength * max_flow / 100,
+                                reduce_by_percentage(g1_feedrate, max_flow)
                             )
                         )
                     else:
                         outPutLine = ""
+                        feedrate_set = False
                         for element in splitLine:
                             if "E" in element:
                                 outPutLine += "E" + str(round(float(element[1:]) * max_flow / 100, 5)) + " "
                             else:
                                 outPutLine += element + " "
+                            if "F" in element:
+                                feedrate_set = True
+                        if not feedrate_set:
+                            outPutLine += f"F{reduce_by_percentage(g1_feedrate, max_flow)}" + " "
                         outPutLine = outPutLine.strip() + "\n"
                         lines.append(outPutLine)
                     writtenToFile = True
@@ -337,17 +362,22 @@ def process_gcode_file(
                     )
 
                     outPutLine = ""
+                    feedrate_set = False
                     for element in splitLine:
                         if "E" in element:
                             if shortestDistance < gradient_thickness:
-                                newE = float(element[1:]) * mapRange(
-                                    (0, gradient_thickness), (max_flow / 100, min_flow / 100), shortestDistance
-                                )
+                                newE = float(element[1:]) * mapRange((0, gradient_thickness), (max_flow / 100, min_flow / 100), shortestDistance)
                             else:
                                 newE = float(element[1:]) * min_flow / 100
                             outPutLine += "E" + str(round(newE, 5)) + " "
                         else:
                             outPutLine += element + " "
+                        if "F" in element:
+                                feedrate_set = True
+                    if not feedrate_set:
+                        if shortestDistance < gradient_thickness:
+                            newF = g1_feedrate / mapRange((0, gradient_thickness), (max_flow / 100, min_flow / 100), shortestDistance)
+                        outPutLine += f"F{round(newF,3)}" + " "
                     outPutLine = outPutLine.strip() + "\n"
                     lines.append(outPutLine)
                     writtenToFile = True
@@ -361,7 +391,7 @@ def process_gcode_file(
                     lines.append(currentLine)
                     writtenToFile = True
 
-            if not writtenToFile and not duplicate_speed_command:
+            if not writtenToFile:
                 lines.append(currentLine)
                 writtenToFile = True
 
@@ -370,7 +400,7 @@ def process_gcode_file(
             if prog_move.search(currentLine):
                 lastPosition = getXY(currentLine)
 
-            if not writtenToFile and not duplicate_speed_command:
+            if not writtenToFile:
                 lines.append(currentLine)
                 writtenToFile = True
 
@@ -405,42 +435,51 @@ def process_gcode_file(
 
     return stats
 
+
+import argparse
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Process a G-code file and override configuration values.")
+    parser.add_argument("gcode_file_path", help="Path to the G-code file to process")
+    parser.add_argument("--max_flow", type=float, help="Override the max_flow value from the config file")
+    parser.add_argument("--min_flow", type=float, help="Override the min_flow value from the config file")
+    parser.add_argument("--gradient_thickness", type=float, help="Override the gradient_thickness value from the config file")
+    parser.add_argument("--gradient_discretization", type=float, help="Override the gradient_discretization value from the config file")
+    return parser.parse_args()
+
 def main():
     try:
-        # The script expects one command-line argument: input G-code file path
-        if len(sys.argv) < 2:
-            print("Usage: script.py <gcode_file_path>")
-            sys.exit(1)
+        # Parse command-line arguments
+        args = parse_args()
 
-        gcode_file_path = sys.argv[1]
-
-        # Read configuration parameters
+        # Read configuration parameters from the config file
         cfg_params = read_config(CONFIG_FILE_PATH)
-        MAX_FLOW = cfg_params['MAX_FLOW']
-        MIN_FLOW = cfg_params['MIN_FLOW']
-        GRADIENT_THICKNESS = cfg_params['GRADIENT_THICKNESS']
-        GRADIENT_DISCRETIZATION = cfg_params['GRADIENT_DISCRETIZATION']
+        max_flow = args.max_flow if args.max_flow is not None else cfg_params['MAX_FLOW']
+        min_flow = args.min_flow if args.min_flow is not None else cfg_params['MIN_FLOW']
+        gradient_thickness = args.gradient_thickness if args.gradient_thickness is not None else cfg_params['GRADIENT_THICKNESS']
+        gradient_discretization = args.gradient_discretization if args.gradient_discretization is not None else cfg_params['GRADIENT_DISCRETIZATION']
 
         # Print the settings used
-        print(f"Using settings from configuration file '{CONFIG_FILE_PATH}':")
-        print(f"  MAX_FLOW = {MAX_FLOW}")
-        print(f"  MIN_FLOW = {MIN_FLOW}")
-        print(f"  GRADIENT_THICKNESS = {GRADIENT_THICKNESS}")
-        print(f"  GRADIENT_DISCRETIZATION = {GRADIENT_DISCRETIZATION}")
+        print(f"Using the following settings:")
+        print(f"  MAX_FLOW = {max_flow}")
+        print(f"  MIN_FLOW = {min_flow}")
+        print(f"  GRADIENT_THICKNESS = {gradient_thickness}")
+        print(f"  GRADIENT_DISCRETIZATION = {gradient_discretization}")
 
+        # Process the G-code file with the parameters (either from the config or overridden via command line)
         start = time.time()
         stats = process_gcode_file(
-            gcode_file_path, MAX_FLOW, MIN_FLOW, GRADIENT_THICKNESS, GRADIENT_DISCRETIZATION
+            args.gcode_file_path, max_flow, min_flow, gradient_thickness, gradient_discretization
         )
         processing_time = time.time() - start
         print('Time to execute:', processing_time)
 
-        # Write log file
-        log_file_name = os.path.splitext(os.path.basename(gcode_file_path))[0] + '.log'
+        # Write log file (if applicable)
+        log_file_name = os.path.splitext(os.path.basename(args.gcode_file_path))[0] + '.log'
         log_file_path = os.path.join(application_path, log_file_name)
         with open(log_file_path, 'w') as log_file:
             log_file.write(f"Processing Date and Time: {datetime.datetime.now()}\n")
-            log_file.write(f"G-code File: {gcode_file_path}\n")
+            log_file.write(f"G-code File: {args.gcode_file_path}\n")
             log_file.write(f"Processing Time: {processing_time:.2f} seconds\n")
             log_file.write(f"Total Lines Processed: {stats['total_lines']}\n")
             log_file.write(f"Modifications Made: {stats['modifications_made']}\n")
@@ -453,10 +492,10 @@ def main():
                 for line in stats['g2_g3_lines']:
                     log_file.write(line + '\n')
             log_file.write("Settings Used:\n")
-            log_file.write(f"  MAX_FLOW: {MAX_FLOW}\n")
-            log_file.write(f"  MIN_FLOW: {MIN_FLOW}\n")
-            log_file.write(f"  GRADIENT_THICKNESS: {GRADIENT_THICKNESS}\n")
-            log_file.write(f"  GRADIENT_DISCRETIZATION: {GRADIENT_DISCRETIZATION}\n")
+            log_file.write(f"  MAX_FLOW: {max_flow}\n")
+            log_file.write(f"  MIN_FLOW: {min_flow}\n")
+            log_file.write(f"  GRADIENT_THICKNESS: {gradient_thickness}\n")
+            log_file.write(f"  GRADIENT_DISCRETIZATION: {gradient_discretization}\n")
 
         print(f"Log file written to: {log_file_path}")
 
